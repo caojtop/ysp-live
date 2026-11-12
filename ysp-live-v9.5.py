@@ -2510,6 +2510,31 @@ TIMESHIFT_SUPPORTED ={
 "gzws","jxws","lnws","ahws","hebws","sdws","tjws","jlws",
 "saxws","nxws","nmgws","ynws","shanxiws","qhws","xizangws","xjws","gsws"
 }
+
+# ==========================================
+# 凤凰卫视（香港三台，HTTP-FLV）
+# 官方直播资源 id 与 akiralereal/iptv 的 extractors/fengshows/channels.js 一致。
+# 游客 480p；配置了 FS_TOKEN 后取 720p。播放时实时换取带签名的 FLV 地址。
+# ==========================================
+FENGSHOWS_CHANNELS =[
+('fsinfo','凤凰资讯','7c96b084-60e1-40a9-89c5-682b994fb680',
+ 'https://q1.fengshows.com/a/2021_22/79dcc3a9da358a3.png','凤凰资讯'),
+('fschinese','凤凰中文','f7f48462-9b13-485b-8101-7b54716411ec',
+ 'https://q1.fengshows.com/a/2021_22/ede3d9e09be28e5.png','凤凰中文'),
+('fshongkong','凤凰香港','15e02d92-1698-416c-af2f-3e9a872b4d78',
+ 'https://q1.fengshows.com/a/2021_23/325d941090bee17.png','凤凰香港'),
+]
+FENGSHOWS_SLUGS ={c [0 ]for c in FENGSHOWS_CHANNELS }
+FS_API ='https://api.fengshows.cn'
+FS_CLIENT ='app(fs-web,1000000);'
+FS_URL_TTL =20.0 
+_fs_url_cache ={}
+_fs_cache_lock =threading .Lock ()
+_fs_token_warned =False 
+
+class FsTokenExpired (Exception ):
+    pass 
+
 def get_channel_group (slug :str )->str :
     s =ALIAS_MAP .get (slug .lower (),slug .lower ())
     if s .startswith ("cctv")or s .startswith ("cgtn"):
@@ -2702,6 +2727,13 @@ class ChannelDirectory :
             self .channels_meta [slug ]={
             'slug':slug ,'name':name ,'sid':sid ,'pid':pid ,'defn':defn ,
             'logo':logo ,'group':grp ,'tvg_id':tid 
+            }
+            self .canonical_slugs .append (slug )
+        for slug ,name ,live_id ,logo ,tvg_id in FENGSHOWS_CHANNELS :
+            self .channels_meta [slug ]={
+            'slug':slug ,'name':name ,'sid':'','pid':'','defn':'fhd',
+            'live_id':live_id ,'logo':logo ,'group':'香港','tvg_id':tvg_id ,
+            'kind':'flv','ext':'.flv'
             }
             self .canonical_slugs .append (slug )
     def get_meta (self ,slug :str )->dict |None :
@@ -3075,6 +3107,112 @@ def fetch_upstream_engine_playlist (canonical :str ,host :str ,proto :str ='http
         except Exception :
             pass 
     return None 
+
+# ==========================================
+# 凤凰卫视取流
+# ==========================================
+def fs_parse_token (raw ):
+    value =(raw or '').strip ()
+    if not value :
+        return ''
+    value =re .sub (r'^\s*Cookie\s*:\s*','',value ,flags =re .I )
+    m =re .search (r'(?:^|;)\s*App\.user\.token=([^;]*)',value )
+    if m :
+        value =m .group (1 )
+    value =value .strip ().strip ('"')
+    try :
+        return urllib .parse .unquote (value )
+    except Exception :
+        return value 
+
+def fs_token ():
+    env_token =(os .environ .get ('FS_TOKEN')or '').strip ()
+    if env_token :
+        return fs_parse_token (env_token )
+    path =os .environ .get ('FS_TOKEN_FILE')or os .path .join (
+    os .environ .get ('YSP_DATA_DIR','/app/data'),'fengshows-token.json')
+    try :
+        with open (path ,encoding ='utf-8')as f :
+            body =f .read ()
+        try :
+            data =json .loads (body )
+            raw =data .get ('token','')if isinstance (data ,dict )else str (data )
+        except ValueError :
+            raw =body 
+        return fs_parse_token (raw )
+    except OSError :
+        return ''
+
+def fs_request_live_url (live_id ,token ):
+    quality ='fhd'if token else 'hd'
+    url =f'{FS_API }/hub/live/auth-url?live_qa={quality }&live_id={live_id }'
+    headers ={'Accept':'application/json','fengshows-client':FS_CLIENT }
+    if token :
+        headers ['token']=token 
+    req =urllib .request .Request (url ,headers =headers )
+    with robust_urlopen (req ,timeout =10 )as resp :
+        body =json .loads (resp .read ().decode ('utf-8','replace'))
+    status =str (body .get ('status'))
+    if status =='0':
+        return body ['data']['live_url']
+    if status =='10005':
+        raise FsTokenExpired ()
+    raise RuntimeError (f'凤凰秀接口 status={status } {body .get ("message","")}')
+
+def fs_live_url (slug ):
+    global _fs_token_warned 
+    now =time .time ()
+    token =fs_token ()
+    key =(slug ,bool (token ))
+    with _fs_cache_lock :
+        cached =_fs_url_cache .get (key )
+    if cached and now -cached [1 ]<FS_URL_TTL :
+        return cached [0 ]
+    meta =global_channel_dir .get_meta (slug )
+    if not meta or meta .get ('kind')!='flv':
+        raise RuntimeError ('未知频道')
+    try :
+        url =fs_request_live_url (meta ['live_id'],token )
+    except FsTokenExpired :
+        # Token 过期自动降级为游客 480p，频道不中断
+        if not _fs_token_warned :
+            log ('[凤凰卫视] Token 已被官网判定过期，三台自动改用游客 480p；请更新 FS_TOKEN')
+            _fs_token_warned =True 
+        url =fs_request_live_url (meta ['live_id'],'')
+    with _fs_cache_lock :
+        _fs_url_cache [key ]=(url ,time .time ())
+    return url 
+
+def fs_final_url (url ):
+    """跟随上游 301，拿到最终 CDN 地址，播放器只需要跟一次跳转。
+    用 GET 而不是 HEAD：凤凰的上游对 HEAD 会跳到下载页，GET 才是正常 FLV。"""
+    req =urllib .request .Request (url ,headers ={'User-Agent':UA ,'Accept':'*/*'})
+    with robust_urlopen (req ,timeout =10 )as resp :
+        return resp .geturl ()
+
+def fs_stream_to (handler ,url ,head_only ):
+    req =urllib .request .Request (url ,headers ={'User-Agent':UA ,'Accept':'*/*'})
+    resp =robust_urlopen (req ,timeout =20 )
+    try :
+        handler .send_response (200 )
+        handler .send_header ('Content-Type','video/x-flv')
+        handler .send_header ('Access-Control-Allow-Origin','*')
+        handler .send_header ('Cache-Control','no-cache, no-store, max-age=0')
+        handler .send_header ('Connection','close')
+        handler .end_headers ()
+        if head_only :
+            return 
+        while True :
+            chunk =resp .read (65536 )
+            if not chunk :
+                break 
+            handler .wfile .write (chunk )
+    finally :
+        try :
+            resp .close ()
+        except Exception :
+            pass 
+
 class Handler (BaseHTTPRequestHandler ):
     server_version ='ysp-live/9.5.1'
     def log_message (self ,fmt ,*args ):
@@ -3173,7 +3311,7 @@ class Handler (BaseHTTPRequestHandler ):
                 if slug in TIMESHIFT_SUPPORTED :
                     attrs +=' catchup="append" catchup-days="7" catchup-source="?playseek=${(b)yyyyMMddHHmmss}-${(e)yyyyMMddHHmmss}"'
                 lines .append (f'#EXTINF:-1{attrs },{name }')
-                lines .append (f'{proto }://{host }/{slug }.m3u8')
+                lines .append (f'{proto }://{host }/{slug }{ch_meta .get ("ext",".m3u8")}')
             self ._send (200 ,'\n'.join (lines )+'\n','application/vnd.apple.mpegurl',head_only =head_only )
             return 
         if path =='/diag':
@@ -3343,6 +3481,24 @@ class Handler (BaseHTTPRequestHandler ):
                     self ._send (resp .status ,data ,resp .headers .get ('Content-Type','video/mp2t'),head_only =head_only )
             except Exception as e :
                 self ._send (502 ,f'engine proxy error: {e }\n',head_only =head_only )
+            return 
+        m =re .match (r'^/([\w-]+)\.flv$',path )
+        if m :
+            slug =m .group (1 ).lower ()
+            if slug not in FENGSHOWS_SLUGS :
+                self ._send (404 ,'未知频道\n',head_only =head_only )
+                return 
+            qs =urllib .parse .parse_qs (parts .query )
+            relay =qs .get ('relay',['0'])[0 ].lower ()in ('1','true','yes')
+            try :
+                upstream =fs_live_url (slug )
+                if relay :
+                    fs_stream_to (self ,upstream ,head_only )
+                else :
+                    self ._send (302 ,'',head_only =head_only ,
+                    extra_headers ={'Location':fs_final_url (upstream )})
+            except Exception as e :
+                self ._send (502 ,f'凤凰卫视取流失败: {e }\n',head_only =head_only )
             return 
         m =re .match (r'^/([\w-]+)\.m3u8$',path )
         if m :
