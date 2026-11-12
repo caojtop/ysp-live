@@ -31,6 +31,7 @@ import urllib .error
 import urllib .parse 
 import urllib .request 
 import uuid 
+import concurrent .futures 
 from collections import deque 
 
 # ==========================================
@@ -2728,9 +2729,13 @@ class ChannelDirectory :
         self .load_defaults ()
     def load_defaults (self ):
         self .canonical_slugs .clear ()
+        used_tids =set ()
         for slug ,name ,sid ,pid ,defn in DEFAULT_CHANNELS :
             grp =get_channel_group (slug )
             tid =TVG_IDS .get (slug ,slug .upper ())
+            while tid in used_tids :
+                tid =f'{tid }-{slug }'
+            used_tids .add (tid )
             logo =f"{LOGO_BASE }/{slug }.png"
             self .channels_meta [slug ]={
             'slug':slug ,'name':name ,'sid':sid ,'pid':pid ,'defn':defn ,
@@ -2738,6 +2743,9 @@ class ChannelDirectory :
             }
             self .canonical_slugs .append (slug )
         for slug ,name ,live_id ,logo ,tvg_id in FENGSHOWS_CHANNELS :
+            while tvg_id in used_tids :
+                tvg_id =f'{tvg_id }-{slug }'
+            used_tids .add (tvg_id )
             self .channels_meta [slug ]={
             'slug':slug ,'name':name ,'sid':'','pid':'','defn':'fhd',
             'live_id':live_id ,'logo':logo ,'group':'香港','tvg_id':tvg_id ,
@@ -3376,6 +3384,245 @@ def fs_stream_to (handler ,url ,head_only ):
         except Exception :
             pass 
 
+# ==========================================
+# EPG（XMLTV）：央视频官方节目单 + 凤凰秀官方节目单
+# ==========================================
+EPG_DAYS =max (1 ,int (os .environ .get ('EPG_DAYS','2')or 2 ))
+EPG_TTL =float (os .environ .get ('EPG_TTL','21600')or 21600 )
+EPG_WORKERS =max (1 ,int (os .environ .get ('EPG_WORKERS','8')or 8 ))
+_epg_cache ={'xml':'','ts':0.0 ,'stats':''}
+_epg_lock =threading .Lock ()
+_EPG_TZ =datetime .timezone (datetime .timedelta (hours =8 ))
+
+def xml_escape (value ):
+    return (str (value ).replace ('&','&amp;').replace ('<','&lt;').replace ('>','&gt;')
+    .replace ('"','&quot;').replace ("'",'&apos;'))
+
+def epg_days (count ):
+    now =datetime .datetime .now (_EPG_TZ )
+    return [(now +datetime .timedelta (days =i )).strftime ('%Y%m%d')for i in range (count )]
+
+def xmltv_time (ms ):
+    dt =datetime .datetime .fromtimestamp (float (ms )/1000.0 ,_EPG_TZ )
+    return dt .strftime ('%Y%m%d%H%M%S +0800')
+
+def _pb_varint (buf ,pos ):
+    value =0 
+    scale =1 
+    while True :
+        if pos >=len (buf ):
+            raise ValueError ('protobuf 被截断')
+        byte =buf [pos ]
+        pos +=1 
+        value +=(byte &0x7f )*scale 
+        if not byte &0x80 :
+            return value ,pos 
+        scale *=128 
+        if scale >2 **56 :
+            raise ValueError ('protobuf 数据异常')
+
+def _pb_fields (buf ):
+    fields =[]
+    pos =0 
+    while pos <len (buf ):
+        tag ,pos =_pb_varint (buf ,pos )
+        field =tag >>3 
+        wire =tag &7 
+        if wire ==0 :
+            value ,pos =_pb_varint (buf ,pos )
+            fields .append ((field ,value ))
+        elif wire ==2 :
+            length ,pos =_pb_varint (buf ,pos )
+            if pos +length >len (buf ):
+                raise ValueError ('protobuf 被截断')
+            fields .append ((field ,buf [pos :pos +length ]))
+            pos +=length 
+        elif wire ==1 :
+            pos +=8 
+        elif wire ==5 :
+            pos +=4 
+        else :
+            raise ValueError ('protobuf 数据异常')
+    return fields 
+
+def ysp_epg_decode (buf ):
+    """央视频 EPG protobuf：顶层字段 2 是节目，节目内 2=标题、3=开始、4=结束（unix 秒）。"""
+    programmes =[]
+    for field ,value in _pb_fields (buf ):
+        if field !=2 or not isinstance (value ,(bytes ,bytearray )):
+            continue 
+        title =''
+        start =0 
+        stop =0 
+        for inner ,v in _pb_fields (value ):
+            if inner ==2 and isinstance (v ,(bytes ,bytearray )):
+                title =v .decode ('utf-8','replace').strip ()
+            elif inner ==3 and isinstance (v ,int ):
+                start =v 
+            elif inner ==4 and isinstance (v ,int ):
+                stop =v 
+        if title and start >0 and stop >start :
+            programmes .append ({'title':title ,'start':start *1000 ,'stop':stop *1000 })
+    programmes .sort (key =lambda item :item ['start'])
+    return programmes 
+
+def _epg_get (url ,headers ,timeout =10 ):
+    req =urllib .request .Request (url ,headers =headers )
+    with robust_urlopen (req ,timeout =timeout )as resp :
+        return resp .read ()
+
+def ysp_epg_day (pid ,day ):
+    url =f'https://capi.yangshipin.cn/api/yspepg/program/{pid }/{day }'
+    try :
+        raw =_epg_get (url ,{'Accept':'*/*','User-Agent':UA })
+    except urllib .error .HTTPError as e :
+        if e .code ==404 :
+            return []
+        raise 
+    return ysp_epg_decode (raw )
+
+def fs_epg_day (live_id ,day ):
+    url =(f'https://api.fengshows.cn/live/{live_id }/resources?dir=asc&date={day }'
+    f'&page=1&page_size=200')
+    raw =_epg_get (url ,{'Accept':'application/json','fengshows-client':FS_CLIENT },timeout =10 )
+    try :
+        payload =json .loads (raw .decode ('utf-8','replace'))
+    except ValueError :
+        raise RuntimeError ('凤凰秀节目单不是 JSON')
+    if not isinstance (payload ,list ):
+        raise RuntimeError ('凤凰秀节目单格式异常')
+    day_start =datetime .datetime (int (day [:4 ]),int (day [4 :6 ]),int (day [6 :8 ]),tzinfo =_EPG_TZ )
+    start_ms =day_start .timestamp ()*1000 
+    end_ms =start_ms +86400000 
+    items =[]
+    for row in payload :
+        if not isinstance (row ,dict ):
+            continue 
+        if row .get ('available')==0 :
+            continue 
+        row_type =row .get ('type')
+        if row_type is not None and row_type !='schedule':
+            continue 
+        title =str (row .get ('title')or '').strip ()
+        event_time =str (row .get ('event_time')or '').strip ()
+        if not title or not event_time :
+            continue 
+        try :
+            dt =datetime .datetime .fromisoformat (event_time .replace ('Z','+00:00'))
+        except ValueError :
+            continue 
+        start =dt .timestamp ()*1000 
+        if start <start_ms or start >=end_ms :
+            continue 
+        items .append ({'title':title ,'start':start })
+    items .sort (key =lambda item :item ['start'])
+    unique =[]
+    for item in items :
+        if unique and item ['start']==unique [-1 ]['start']:
+            continue 
+        unique .append (item )
+    out =[]
+    for index ,item in enumerate (unique ):
+        stop =unique [index +1 ]['start']if index +1 <len (unique )else end_ms 
+        if stop >item ['start']:
+            out .append ({'title':item ['title'],'start':item ['start'],'stop':stop })
+    return out 
+
+def epg_build_xml ():
+    channels =global_channel_dir .unique_channels ()
+    days =epg_days (EPG_DAYS )
+    jobs =[]
+    key_to_tid ={}
+    for meta in channels :
+        if meta .get ('pid'):
+            provider ,key ='ysp',meta ['pid']
+        elif meta .get ('live_id'):
+            provider ,key ='fs',meta ['live_id']
+        else :
+            continue 
+        key_to_tid [(provider ,key )]=meta ['tvg_id']
+        for day in days :
+            jobs .append ((provider ,key ,day ))
+
+    def fetch (job ):
+        provider ,key ,day =job 
+        if provider =='ysp':
+            return job ,ysp_epg_day (key ,day )
+        return job ,fs_epg_day (key ,day )
+
+    results ={}
+    errors =[]
+    if jobs :
+        with concurrent .futures .ThreadPoolExecutor (max_workers =EPG_WORKERS )as pool :
+            futures =[pool .submit (fetch ,job )for job in jobs ]
+            for future in concurrent .futures .as_completed (futures ):
+                try :
+                    job ,items =future .result ()
+                except Exception as e :
+                    errors .append (str (e ))
+                    continue 
+                results .setdefault ((job [0 ],job [1 ]),[]).extend (items )
+
+    merged ={}
+    for key ,items in results .items ():
+        items .sort (key =lambda item :item ['start'])
+        deduped =[]
+        for item in items :
+            if deduped and item ['start']==deduped [-1 ]['start']:
+                continue 
+            deduped .append (item )
+        merged [key ]=deduped 
+
+    lines =['<?xml version="1.0" encoding="UTF-8"?>',
+    '<!DOCTYPE tv SYSTEM "xmltv.dtd">',
+    '<tv generator-info-name="ysp-live">']
+    for meta in channels :
+        lines .append (f'  <channel id="{xml_escape (meta ["tvg_id"])}">'
+        f'<display-name lang="zh">{xml_escape (meta ["name"])}</display-name></channel>')
+    total_programmes =0 
+    covered =0 
+    for key ,items in merged .items ():
+        if not items :
+            continue 
+        covered +=1 
+        tid =key_to_tid .get (key )
+        if not tid :
+            continue 
+        for item in items :
+            total_programmes +=1 
+            lines .append (f'  <programme channel="{xml_escape (tid )}" start="{xmltv_time (item ["start"])}" stop="{xmltv_time (item ["stop"])}">')
+            lines .append (f'    <title lang="zh">{xml_escape (item ["title"])}</title>')
+            lines .append ('  </programme>')
+    lines .append ('</tv>')
+    stats =(f'{len (channels )} 个频道，{covered } 路有节目，{total_programmes } 条节目'
+    +(f'，{len (errors )} 个请求失败'if errors else ''))
+    return '\n'.join (lines )+'\n',stats 
+
+def epg_get_xml (force =False ):
+    now =time .time ()
+    with _epg_lock :
+        if not force and _epg_cache ['xml']and now -_epg_cache ['ts']<EPG_TTL :
+            return _epg_cache ['xml']
+        started =time .time ()
+        try :
+            xml ,stats =epg_build_xml ()
+        except Exception :
+            if _epg_cache ['xml']:
+                log ('[EPG] 本轮生成失败，继续使用上一份缓存')
+                return _epg_cache ['xml']
+            raise 
+        _epg_cache .update ({'xml':xml ,'ts':time .time (),'stats':stats })
+        log (f'[EPG] 已生成 {stats }，耗时 {max (1 ,int (time .time ()-started ))}s')
+        return xml 
+
+def epg_refresh_worker ():
+    while True :
+        try :
+            epg_get_xml (force =True )
+        except Exception as e :
+            log (f'[EPG] 生成失败: {e }')
+        time .sleep (max (300.0 ,EPG_TTL ))
+
 class Handler (BaseHTTPRequestHandler ):
     server_version ='ysp-live/9.5.1'
     def log_message (self ,fmt ,*args ):
@@ -3443,7 +3690,7 @@ class Handler (BaseHTTPRequestHandler ):
             },
             "channels":len (global_channel_dir .unique_channels ()),
             "ts_cache":cache_info ,
-            "routes":["/","/all.m3u","/diag","/health","/fs/status","/<channel>.m3u8","/proxy.ts"]
+            "routes":["/","/all.m3u","/epg.xml","/diag","/health","/fs/status","/<channel>.m3u8","/proxy.ts"]
             }
             self ._send (200 ,json .dumps (health_data ,ensure_ascii =False ,indent =2 ),'application/json; charset=utf-8',head_only =head_only )
             return 
@@ -3472,6 +3719,9 @@ class Handler (BaseHTTPRequestHandler ):
                 rows .append (row )
             self ._send (200 ,json .dumps ({'channels':rows },ensure_ascii =False ,indent =2 ),'application/json; charset=utf-8',head_only =head_only )
             return 
+        if path =='/epg.xml':
+            self ._send (200 ,epg_get_xml (),'application/xml; charset=utf-8',head_only =head_only )
+            return 
         if path =='/all.m3u':
             host =self .headers .get ('Host',f'localhost:{server_port }')
             proto =self .headers .get ('X-Forwarded-Proto','http').split (',')[0 ].strip ().lower ()or 'http'
@@ -3479,8 +3729,9 @@ class Handler (BaseHTTPRequestHandler ):
             target_group =qs .get ('group',[None ])[0 ]
             k4_val =qs .get ('k4',['0'])[0 ].lower ()
             only_4k =k4_val in ('1','true','yes')
+            epg_self =f'{proto }://{host }/epg.xml'
             lines =[
-            '#EXTM3U url-tvg="https://epg.zsdc.eu.org/t.xml.gz,https://epg.pw/xmltv/epg_CN.xml.gz" x-tvg-url="https://epg.zsdc.eu.org/t.xml.gz"',
+            f'#EXTM3U url-tvg="{epg_self },https://epg.zsdc.eu.org/t.xml.gz,https://epg.pw/xmltv/epg_CN.xml.gz" x-tvg-url="{epg_self }"',
             '#EXT-X-APTV-PREVIEW: FALSE',
             '#EXT-X-APTV-LATENCY: FALSE',
             '#EXT-X-APTV-LOGO: FALSE'
@@ -3958,6 +4209,7 @@ def main ():
     log ('====================================================================')
     log (f'ysp-live v9.5.1 启动成功: {channels_count } 个独立频道 (央视 {c_yangshi } 路, 卫视 {c_weishi } 路, 香港 {c_hk } 路)')
     log (f'全频道订阅:   http://localhost:{args .port }/all.m3u')
+    log (f'EPG 订阅:     http://localhost:{args .port }/epg.xml')
     log (f'系统健康度:   http://localhost:{args .port }/health')
     log (f'实时诊断日志: http://localhost:{args .port }/diag')
     log (f'{RED_BOLD}--------------------------------------------------------------------{RESET}')
@@ -3975,6 +4227,7 @@ def main ():
             _fs_renew_next_try =_fs_renew_last_err +3600 
     threading .Thread (target =fs_startup_report ,daemon =True ,name ='fs-report').start ()
     threading .Thread (target =fs_token_keeper ,daemon =True ,name ='fs-renew').start ()
+    threading .Thread (target =epg_refresh_worker ,daemon =True ,name ='epg-refresh').start ()
     try :
         srv .serve_forever ()
     except KeyboardInterrupt :
