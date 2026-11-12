@@ -17,6 +17,8 @@ services:
       - TZ=Asia/Shanghai
       - PYTHONUNBUFFERED=1
       - YSP_DATA_DIR=/app/data
+      # 凤凰卫视：留空=游客 480p；填 App.user.token=… 或只填 token 值 = 720p
+      - FS_TOKEN=
       - NODE_OPTIONS="--max-old-space-size=256 --optimize-for-size"  # 优化 V8 内存与垃圾回收
     logging:
       driver: "json-file"
