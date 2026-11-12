@@ -3,6 +3,7 @@ services:
     image: ysp-live:9.5.1
     build:
       context: .
+      network: host
       dockerfile: Dockerfile
     container_name: ysp-live
     restart: unless-stopped
@@ -19,6 +20,15 @@ services:
       - YSP_DATA_DIR=/app/data
       # 凤凰卫视：留空=游客 480p；填 App.user.token=… 或只填 token 值 = 720p
       - FS_TOKEN=
+      # 也可以把 token 放进 /app/data/fengshows-token.json（{"token":"..."}），此时不用上面这行
+      # 自动获取 + 续期：填凤凰秀手机号和密码即可，Token 会自动写入 /app/data/fengshows-token.json
+      # 注意：FS_TOKEN 一旦非空会优先使用并跳过自动续期
+      - FS_PHONE=15659285598
+      - FS_PASSWORD=cj141421
+      - FS_AREA_CODE=86
+      # 校验间隔（秒）/ 主动换新周期（秒），默认 30 分钟校验、6 小时换新
+      - FS_CHECK_INTERVAL=1800
+      - FS_TOKEN_MAX_AGE=21600
       - NODE_OPTIONS="--max-old-space-size=256 --optimize-for-size"  # 优化 V8 内存与垃圾回收
     logging:
       driver: "json-file"
