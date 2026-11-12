@@ -284,7 +284,7 @@ def log (msg ,min_interval =0.0 ):
             _last_log_times .clear ()
         line ='[%s] %s'%(time .strftime ('%H:%M:%S'),clean_msg )
         global_log_ring .append (line )
-    print (line ,flush =True )
+        print (line ,flush =True )
 
 # ==========================================
 # 优化补丁：抗 DNS 抖动网络请求 & 后台任务抢占（插队）机制
@@ -2526,11 +2526,19 @@ FENGSHOWS_CHANNELS =[
 ]
 FENGSHOWS_SLUGS ={c [0 ]for c in FENGSHOWS_CHANNELS }
 FS_API ='https://api.fengshows.cn'
+FS_LOGIN_API ='https://m.fengshows.com/api/v3/mp/user/login'
 FS_CLIENT ='app(fs-web,1000000);'
 FS_URL_TTL =20.0 
+FS_CHECK_INTERVAL =float (os .environ .get ('FS_CHECK_INTERVAL','1800')or 1800 )
+FS_TOKEN_MAX_AGE =float (os .environ .get ('FS_TOKEN_MAX_AGE','21600')or 21600 )
 _fs_url_cache ={}
 _fs_cache_lock =threading .Lock ()
 _fs_token_warned =False 
+_fs_last_token =''
+_fs_play_log ={}
+_fs_token_status ='unknown'
+_fs_token_written_at =0.0 
+_fs_renew_lock =threading .Lock ()
 
 class FsTokenExpired (Exception ):
     pass 
@@ -3154,34 +3162,189 @@ def fs_request_live_url (live_id ,token ):
         body =json .loads (resp .read ().decode ('utf-8','replace'))
     status =str (body .get ('status'))
     if status =='0':
-        return body ['data']['live_url']
+        return body ['data']['live_url'],quality 
     if status =='10005':
         raise FsTokenExpired ()
     raise RuntimeError (f'凤凰秀接口 status={status } {body .get ("message","")}')
 
+def fs_quality_label (quality ):
+    # 凤凰秀接口档位名是 fhd，实际分辨率 1280x720；hd 是 854x480。
+    return '720p'if quality =='fhd'else '480p'
+
+def fs_note_for (tag ):
+    if tag =='token':
+        return 'Token 已生效'
+    if tag =='expired':
+        return 'Token 已过期，已自动降级'
+    return '游客档，未配置 Token'
+
+def fs_token_summary ():
+    if not fs_token ():
+        return '未配置，游客 480p'
+    if _fs_token_status =='expired':
+        return '已配置，但官网已判定过期（当前 480p）'
+    if _fs_token_status =='token':
+        return '已配置，720p 生效'
+    return '已配置（尚未校验）'
+
+def fs_login ():
+    phone =(os .environ .get ('FS_PHONE')or '').strip ()
+    password =os .environ .get ('FS_PASSWORD')or ''
+    if not phone or not password :
+        raise RuntimeError ('未配置 FS_PHONE / FS_PASSWORD')
+    area =(os .environ .get ('FS_AREA_CODE')or '86').strip ()or '86'
+    payload =json .dumps ({'phone':phone ,'code':area ,'password':password ,'keep_alive':True }).encode ('utf-8')
+    req =urllib .request .Request (FS_LOGIN_API ,data =payload ,headers ={
+    'Content-Type':'application/json','Accept':'application/json','fengshows-client':FS_CLIENT })
+    with robust_urlopen (req ,timeout =15 )as resp :
+        body =json .loads (resp .read ().decode ('utf-8','replace'))
+    data =body .get ('data')
+    token =data .get ('token','')if isinstance (data ,dict )else ''
+    token =token or body .get ('token')or ''
+    if not token :
+        raise RuntimeError (body .get ('message')or f'登录失败 status={body .get ("status")}')
+    return fs_parse_token (token )
+
+def fs_token_file_path ():
+    return os .environ .get ('FS_TOKEN_FILE')or os .path .join (
+    os .environ .get ('YSP_DATA_DIR','/app/data'),'fengshows-token.json')
+
+def fs_write_token (token ):
+    global _fs_token_written_at 
+    path =fs_token_file_path ()
+    directory =os .path .dirname (path )or '.'
+    os .makedirs (directory ,exist_ok =True )
+    tmp =path +'.tmp'
+    with open (tmp ,'w',encoding ='utf-8')as f :
+        json .dump ({'token':token ,'updated_at':int (time .time ())},f ,ensure_ascii =False )
+    os .replace (tmp ,path )
+    try :
+        os .chmod (path ,0o600 )
+    except OSError :
+        pass 
+    _fs_token_written_at =time .time ()
+
+def fs_check_token (token ):
+    """True=720p 可用；False=Token 过期；None=网络/接口异常（不要据此重新登录）"""
+    if not token :
+        return False 
+    url =f'{FS_API }/hub/live/auth-url?live_qa=fhd&live_id={FENGSHOWS_CHANNELS [0 ][2 ]}'
+    req =urllib .request .Request (url ,headers ={'Accept':'application/json','fengshows-client':FS_CLIENT ,'token':token })
+    try :
+        with robust_urlopen (req ,timeout =12 )as resp :
+            body =json .loads (resp .read ().decode ('utf-8','replace'))
+    except Exception :
+        return None 
+    status =str (body .get ('status'))
+    if status =='0':
+        return True 
+    if status =='10005':
+        return False 
+    return None 
+
+def fs_token_renew_once (force =False ):
+    """校验现有 Token，失效或超过 FS_TOKEN_MAX_AGE 就重新登录并写文件。返回是否换了新 Token。"""
+    with _fs_renew_lock :
+        token =fs_token ()
+        if token and not force and (time .time ()-_fs_token_written_at )<FS_TOKEN_MAX_AGE :
+            state =fs_check_token (token )
+            if state is not False :
+                return False 
+        elif token and not force :
+            state =fs_check_token (token )
+            if state is None :
+                return False 
+        new_token =fs_login ()
+        if fs_check_token (new_token )is not True :
+            raise RuntimeError ('新 Token 未通过官网 720p 校验')
+        fs_write_token (new_token )
+        log (f'[凤凰卫视] 自动续期成功，新 Token 已写入 {fs_token_file_path ()}（720p 校验通过）')
+        return True 
+
+_fs_renew_last_err =0.0 
+_fs_renew_next_try =0.0 
+
+def fs_token_keeper ():
+    if (os .environ .get ('FS_TOKEN')or '').strip ():
+        log ('[凤凰卫视] 已手动指定 FS_TOKEN（环境变量优先级最高），跳过自动续期')
+        return 
+    if not (os .environ .get ('FS_PHONE')or '').strip ()or not (os .environ .get ('FS_PASSWORD')or ''):
+        log ('[凤凰卫视] 未配置 FS_PHONE / FS_PASSWORD，跳过自动续期；只能手动放 Token')
+        return 
+    global _fs_renew_last_err ,_fs_renew_next_try 
+    log (f'[凤凰卫视] 自动续期已启用：每 {int (FS_CHECK_INTERVAL )} 秒校验一次，最多 {int (FS_TOKEN_MAX_AGE //3600 )} 小时主动换新')
+    while True :
+        wait =_fs_renew_next_try -time .time ()
+        if wait >0 :
+            time .sleep (min (FS_CHECK_INTERVAL ,wait ))
+            continue 
+        try :
+            fs_token_renew_once ()
+            _fs_renew_next_try =0.0 
+        except Exception as e :
+            now =time .time ()
+            _fs_renew_next_try =now +3600 
+            if now -_fs_renew_last_err >=3600 :
+                log (f'[凤凰卫视] 自动续期失败: {e }（1 小时内不再重试）')
+                _fs_renew_last_err =now 
+        time .sleep (FS_CHECK_INTERVAL )
+
 def fs_live_url (slug ):
-    global _fs_token_warned 
+    """返回 (带签名的 FLV 地址, 档位 fhd/hd, 来源 token/guest/expired)。"""
+    global _fs_token_warned ,_fs_last_token ,_fs_token_status 
     now =time .time ()
     token =fs_token ()
+    # Token 文件被续期器改写后，下一轮立刻用新 Token，无需重启
+    if token !=_fs_last_token :
+        if _fs_last_token and token :
+            log ('[凤凰卫视] 检测到 Token 变更，已清除签名缓存，下一次换签使用新 Token')
+        _fs_last_token =token 
+        _fs_token_warned =False 
+        with _fs_cache_lock :
+            _fs_url_cache .clear ()
     key =(slug ,bool (token ))
     with _fs_cache_lock :
         cached =_fs_url_cache .get (key )
-    if cached and now -cached [1 ]<FS_URL_TTL :
-        return cached [0 ]
+    if cached and now -cached [3 ]<FS_URL_TTL :
+        return cached [0 ],cached [1 ],cached [2 ]
     meta =global_channel_dir .get_meta (slug )
     if not meta or meta .get ('kind')!='flv':
         raise RuntimeError ('未知频道')
+    tag ='token'if token else 'guest'
     try :
-        url =fs_request_live_url (meta ['live_id'],token )
+        url ,quality =fs_request_live_url (meta ['live_id'],token )
     except FsTokenExpired :
         # Token 过期自动降级为游客 480p，频道不中断
         if not _fs_token_warned :
-            log ('[凤凰卫视] Token 已被官网判定过期，三台自动改用游客 480p；请更新 FS_TOKEN')
+            log ('[凤凰卫视] Token 已被官网判定过期，三台自动改用游客 480p；请更新 Token')
             _fs_token_warned =True 
-        url =fs_request_live_url (meta ['live_id'],'')
+        url ,quality =fs_request_live_url (meta ['live_id'],'')
+        tag ='expired'
     with _fs_cache_lock :
-        _fs_url_cache [key ]=(url ,time .time ())
-    return url 
+        _fs_url_cache [key ]=(url ,quality ,tag ,time .time ())
+    _fs_token_status =tag 
+    return url ,quality ,tag 
+
+def fs_log_play (slug ,quality ,tag ):
+    """docker logs 里能看到当前是 480p 还是 720p；同档位 5 分钟内不重复刷。"""
+    now =time .time ()
+    prev =_fs_play_log .get (slug )
+    if prev and prev [0 ]==quality and prev [1 ]==tag and now -prev [2 ]<300 :
+        return 
+    _fs_play_log [slug ]=(quality ,tag ,now )
+    meta =global_channel_dir .get_meta (slug )or {}
+    log (f'[凤凰卫视] {meta .get ("name",slug )} 当前画质={fs_quality_label (quality )}（{fs_note_for (tag )}）')
+
+def fs_startup_report ():
+    if not fs_token ():
+        log ('[凤凰卫视] 未配置 Token，凤凰资讯 / 凤凰中文 / 凤凰香港 均为游客 480p')
+        return 
+    for slug ,name ,live_id ,logo ,tvg_id in FENGSHOWS_CHANNELS :
+        try :
+            _url ,quality ,tag =fs_live_url (slug )
+            log (f'[凤凰卫视] {name} 当前画质={fs_quality_label (quality )}（{fs_note_for (tag )}）')
+        except Exception as e :
+            log (f'[凤凰卫视] {name} 取流检查失败: {e }')
 
 def fs_final_url (url ):
     """跟随上游 301，拿到最终 CDN 地址，播放器只需要跟一次跳转。
@@ -3280,9 +3443,34 @@ class Handler (BaseHTTPRequestHandler ):
             },
             "channels":len (global_channel_dir .unique_channels ()),
             "ts_cache":cache_info ,
-            "routes":["/","/all.m3u","/diag","/health","/<channel>.m3u8","/proxy.ts"]
+            "routes":["/","/all.m3u","/diag","/health","/fs/status","/<channel>.m3u8","/proxy.ts"]
             }
             self ._send (200 ,json .dumps (health_data ,ensure_ascii =False ,indent =2 ),'application/json; charset=utf-8',head_only =head_only )
+            return 
+        if path =='/fs/status':
+            qs =urllib .parse .parse_qs (parts .query )
+            probe =qs .get ('probe',['0'])[0 ].lower ()in ('1','true','yes')
+            token_on =bool (fs_token ())
+            rows =[]
+            for slug ,name ,live_id ,logo ,tvg_id in FENGSHOWS_CHANNELS :
+                rec =_fs_play_log .get (slug )
+                row ={'slug':slug ,'name':name ,'token_configured':token_on ,'token_status':fs_token_summary ()}
+                if rec :
+                    row ['quality']=rec [0 ]
+                    row ['quality_label']=fs_quality_label (rec [0 ])
+                    row ['source']=rec [1 ]
+                    row ['checked_ago_sec']=int (time .time ()-rec [2 ])
+                if probe :
+                    try :
+                        _u ,q ,t =fs_live_url (slug )
+                        row ['quality']=q 
+                        row ['quality_label']=fs_quality_label (q )
+                        row ['source']=t 
+                        row ['checked_ago_sec']=0 
+                    except Exception as e :
+                        row ['error']=str (e )
+                rows .append (row )
+            self ._send (200 ,json .dumps ({'channels':rows },ensure_ascii =False ,indent =2 ),'application/json; charset=utf-8',head_only =head_only )
             return 
         if path =='/all.m3u':
             host =self .headers .get ('Host',f'localhost:{server_port }')
@@ -3351,6 +3539,16 @@ class Handler (BaseHTTPRequestHandler ):
                         cooldown_str =f' [高码冷却剩{rem_sec }s]'
                 err_msg =ch .last_error if ch else '无'
                 info .append (f"{slug } ({ch_meta ['name']}) 模式={mode_str }{cooldown_str } 上次刷新={age } 错误={err_msg or '无'}")
+            info .append ('--- 凤凰卫视（FLV）---')
+            info .append (f"Token：{fs_token_summary ()}")
+            for slug ,name ,live_id ,logo ,tvg_id in FENGSHOWS_CHANNELS :
+                rec =_fs_play_log .get (slug )
+                if rec :
+                    q_label =fs_quality_label (rec [0 ])
+                    seen ='%ds前'%int (now -rec [2 ])
+                    info .append (f'{name }：{q_label }（{fs_note_for (rec [1 ])}，{seen }）')
+                else :
+                    info .append (f'{name }：尚未播放')
             if global_log_ring :
                 info .append ('--- 最近运行事件 (最新 30 条) ---')
                 clean_logs = [re.sub(r'\033\[[0-9;]*m', '', line) for line in list(global_log_ring)[-30:]]
@@ -3491,7 +3689,8 @@ class Handler (BaseHTTPRequestHandler ):
             qs =urllib .parse .parse_qs (parts .query )
             relay =qs .get ('relay',['0'])[0 ].lower ()in ('1','true','yes')
             try :
-                upstream =fs_live_url (slug )
+                upstream ,quality ,tag =fs_live_url (slug )
+                fs_log_play (slug ,quality ,tag )
                 if relay :
                     fs_stream_to (self ,upstream ,head_only )
                 else :
@@ -3681,7 +3880,7 @@ try :
 except Exception :
     pass 
 def main ():
-    global resolver ,server_port ,engine_port ,global_channel_dir ,global_ts_cache 
+    global resolver ,server_port ,engine_port ,global_channel_dir ,global_ts_cache ,_fs_renew_last_err ,_fs_renew_next_try 
     if os.name == 'nt':
         os.system('') 
     ap =argparse .ArgumentParser (description ='央视频全频道直播代理（ysp-live v9.5.1）')
@@ -3752,11 +3951,12 @@ def main ():
     channels_count =len (global_channel_dir .unique_channels ())
     c_yangshi =len ([c for c in global_channel_dir .unique_channels ()if c ['group']=='央视'])
     c_weishi =len ([c for c in global_channel_dir .unique_channels ()if c ['group']=='卫视'])
+    c_hk =len ([c for c in global_channel_dir .unique_channels ()if c ['group']=='香港'])
     RED_BOLD = '\033[1;31m'
     RESET = '\033[0m'
 
     log ('====================================================================')
-    log (f'ysp-live v9.5.1 启动成功: {channels_count } 个独立频道 (央视 {c_yangshi } 路, 卫视 {c_weishi } 路)')
+    log (f'ysp-live v9.5.1 启动成功: {channels_count } 个独立频道 (央视 {c_yangshi } 路, 卫视 {c_weishi } 路, 香港 {c_hk } 路)')
     log (f'全频道订阅:   http://localhost:{args .port }/all.m3u')
     log (f'系统健康度:   http://localhost:{args .port }/health')
     log (f'实时诊断日志: http://localhost:{args .port }/diag')
@@ -3766,6 +3966,15 @@ def main ():
     log (f'{RED_BOLD}频道：TMXKの分享 ({AUTHOR_CHANNEL}){RESET}')
     log (f'{RED_BOLD}⚠️ 其他任何分发渠道均非作者本人！{RESET}')
     log (f'{RED_BOLD}===================================================================={RESET}')
+    if (os .environ .get ('FS_PHONE')or '').strip ()and (os .environ .get ('FS_PASSWORD')or '').strip ():
+        try :
+            fs_token_renew_once ()
+        except Exception as e :
+            log (f'[凤凰卫视] 启动时自动获取 Token 失败: {e }')
+            _fs_renew_last_err =time .time ()
+            _fs_renew_next_try =_fs_renew_last_err +3600 
+    threading .Thread (target =fs_startup_report ,daemon =True ,name ='fs-report').start ()
+    threading .Thread (target =fs_token_keeper ,daemon =True ,name ='fs-renew').start ()
     try :
         srv .serve_forever ()
     except KeyboardInterrupt :
