@@ -3048,6 +3048,19 @@ def _refresh_once (ch ):
                 ch .mode ='bk'
                 log (f'[{ch .slug }] JCE 域名受限，自动切换 bkliveinfo 备用通道',min_interval =10.0 )
                 ok =bk_refresh (ch )
+            except RuntimeError as e :
+                # Only PDT overlap is a timeline-integrity failure that can be
+                # recovered by switching to the independent BK playlist.
+                if 'JCE PDT overlap=' not in str(e):
+                    raise
+                previous_mode = ch.mode
+                ch.mode = 'bk'
+                try:
+                    ok = bk_refresh(ch)
+                except Exception as bk_error:
+                    ch.mode = previous_mode
+                    raise RuntimeError('JCE PDT overlap; BK fallback failed: %s' % bk_error) from bk_error
+                log(f'[{ch.slug}] JCE PDT 时间轴重叠，已切换 BK 备用源', min_interval=10.0)
         if ok :
             ch .last_ok =time .time ()
         return ok 
