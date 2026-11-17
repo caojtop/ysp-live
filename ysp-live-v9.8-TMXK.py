@@ -2868,7 +2868,13 @@ def parse_jce_live_window(text, base_url, now, with_target=False):
                 # Tiny segments do not inherit an unsafe blanket 50ms tolerance.
                 overlap_limit = min(0.15, 0.05 * min(previous_duration, duration))
                 if gap < -overlap_limit - 1e-7:
-                    raise RuntimeError('JCE overlapping PDT (%.3fs)' % -gap)
+                    raise RuntimeError(
+                        'JCE PDT overlap=%.3fs prev=%.3f+%.3f '
+                        'curr=%.3f+%.3f limit=%.3fs' % (
+                            -gap, previous_start, previous_duration,
+                            stamp, duration, overlap_limit
+                        )
+                    )
                 # PDT maps wall time, not media timestamp continuity. Positive gaps
                 # alone do not justify dropping segments or inventing DISCONTINUITY.
             previous_start = stamp
@@ -3017,7 +3023,7 @@ def bk_refresh (ch ):
             try :
                 ch .bk_urls =bk_playurls (ch .sid ,ch .pid ,ch .defn )
                 ch .bk_urls_time =time .time ()
-                log (f'[{ch .slug }] {defn_label (ch .defn )} 地址已过期，已重新拉取',min_interval =10.0 )
+                log (f'[{ch .slug }] {ch.defn} 地址已过期，已重新拉取',min_interval =10.0 )
             except Exception :
                 pass 
     ch .bk_urls =[]
@@ -3047,10 +3053,10 @@ def _refresh_once (ch ):
         return ok 
     except Exception as e :
         ch .last_error =('%s: %s'%(type (e ).__name__ ,e ))[:120 ]
-        log (f'[{ch .slug }] {defn_label (ch .defn )} 刷新异常: {ch .last_error }',min_interval =15.0 )
+        log (f'[{ch .slug }] {ch.defn} 刷新异常: {ch .last_error }',min_interval =15.0 )
         return False 
 def refresh_loop (ch ):
-    log (f'[{ch .slug }] {defn_label (ch .defn )} 后台拉取启动 [{ch .mode }]',min_interval =10.0 )
+    log (f'[{ch .slug }] {ch.defn} 后台拉取启动 [{ch .mode }]',min_interval =10.0 )
     fails =0 
     if time .time ()-ch .last_ok <REFRESH_INTERVAL :
         build_playlist (ch ,holdback =True )
