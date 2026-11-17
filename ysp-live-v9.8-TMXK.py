@@ -1283,7 +1283,11 @@ class Resolver :
                 entry =self .refresh_channel_controlled (channel )
             except YsptpError as err :
                 err_text =str (err )
-                if 'HTTP 400'in err_text and self .rotate_device_on_400 (channel +':'+err_text [:60 ]):
+                # A live/v1/01 HTTP 400 is channel/API-specific. Rotating the
+                # shared device identity here invalidates every other channel
+                # while not fixing a rejected CCTV live request.
+                live01_bad_request = 'live/v1/01 http 400' in err_text.lower()
+                if 'HTTP 400' in err_text and not live01_bad_request and self .rotate_device_on_400 (channel +':'+err_text [:60 ]):
                     try :
                         entry =self .refresh_channel_controlled (channel )
                     except Exception :
@@ -2864,9 +2868,12 @@ def parse_jce_live_window(text, base_url, now, with_target=False):
                 if stamp + duration <= previous_end:
                     raise RuntimeError('JCE non-increasing segment end')
                 gap = stamp - previous_end
-                # Bound overlap both absolutely and relative to BOTH neighbors.
-                # Tiny segments do not inherit an unsafe blanket 50ms tolerance.
-                overlap_limit = min(0.15, 0.05 * min(previous_duration, duration))
+                # Small encoder clock overlaps are common in live windows.
+                # Keep the media sequence and durations intact; jce_refresh()
+                # suppresses ambiguous PDT tags for this playback session.
+                # Reject only material overlaps (max 750ms / 15% of the
+                # shorter adjacent segment).
+                overlap_limit = min(0.75, 0.15 * min(previous_duration, duration))
                 if gap < -overlap_limit - 1e-7:
                     raise RuntimeError(
                         'JCE PDT overlap=%.3fs prev=%.3f+%.3f '
@@ -2999,11 +3006,15 @@ def jce_refresh(ch):
 def bk_refresh (ch ):
     global_flow_limiter .wait_slot ()
     now =time .time ()
+    blocked_until = getattr(ch, 'bk_blocked_until', 0.0)
+    if now < blocked_until:
+        raise RuntimeError('BK rate limited; channel cooldown %.0fs' % (blocked_until-now))
     if now -ch .bk_urls_time >BK_URL_TTL or not ch .bk_urls :
         ch .bk_urls =bk_playurls (ch .sid ,ch .pid ,ch .defn )
         ch .bk_urls_time =now 
         log (f'[{ch .slug }] bkliveinfo 备用通道就绪 ({len (ch .bk_urls )} 地址)',min_interval =60.0 )
     last_err =''
+    expired = False
     for attempt in range (2 ):
         for u in list (ch .bk_urls ):
             try :
@@ -3011,24 +3022,47 @@ def bk_refresh (ch ):
                 if '#EXTM3U'not in pl :
                     continue 
                 with ch .lock :
-                    ch .bk_playlist =pl 
+                    ch .bk_playlist =pl
                     ch .last_error =''
-                return True 
-            except urllib .error .HTTPError as e :
-                last_err ='HTTPError: HTTP %s'%e .code 
-                continue 
-            except Exception as e :
-                last_err ='%s: %s'%(type (e ).__name__ ,e )
-        if attempt ==0 :
-            try :
-                ch .bk_urls =bk_playurls (ch .sid ,ch .pid ,ch .defn )
-                ch .bk_urls_time =time .time ()
-                log (f'[{ch .slug }] {ch.defn} 地址已过期，已重新拉取',min_interval =10.0 )
-            except Exception :
-                pass 
-    ch .bk_urls =[]
-    ch .bk_urls_time =0 
-    raise RuntimeError (last_err [:120 ]or 'bk playlist failed')
+                    ch.bk_blocked_until = 0.0
+                return True
+            except urllib .error .HTTPError as e:
+                last_err ='HTTPError: HTTP %s' % e.code
+                if e.code == 429:
+                    delay = 60.0
+                    retry_after = e.headers.get('Retry-After') if e.headers else None
+                    if retry_after:
+                        try:
+                            delay = max(delay, float(retry_after))
+                        except (ValueError, TypeError):
+                            try:
+                                from email.utils import parsedate_to_datetime
+                                delay = max(delay, parsedate_to_datetime(retry_after).timestamp()-time.time())
+                            except Exception:
+                                pass
+                    if not math.isfinite(delay):
+                        delay = 60.0
+                    ch.bk_blocked_until = time.time() + delay
+                    raise RuntimeError('BK HTTP 429 rate limited; cooldown %.0fs' % delay) from e
+                if e.code in (401, 403, 404):
+                    expired = True
+                continue
+            except Exception as e:
+                last_err ='%s: %s' % (type(e).__name__, e)
+        # Only an explicit expired/denied URL justifies resolving a fresh BK URL.
+        # Transient 5xx/network errors get one bounded retry against existing URLs.
+        if attempt == 0 and expired:
+            try:
+                ch.bk_urls = bk_playurls(ch.sid, ch.pid, ch.defn)
+                ch.bk_urls_time = time.time()
+                expired = False
+                log(f'[{ch.slug}] {ch.defn} BK 地址过期/拒绝，已重新获取', min_interval=10.0)
+            except Exception as e:
+                last_err = '%s: %s' % (type(e).__name__, e)
+    if expired:
+        ch.bk_urls = []
+        ch.bk_urls_time = 0
+    raise RuntimeError(last_err[:120] or 'bk playlist failed')
 def refresh_once(ch):
     if not ch.refresh_lock.acquire(blocking=False):
         return False
