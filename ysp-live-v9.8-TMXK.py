@@ -2435,9 +2435,27 @@ def bk_playurls (channel_id ,live_pid ,defn ='fhd'):
     return urls 
 def fetch_abs_playlist (url ,depth =0 ):
     req =urllib .request .Request (url ,headers ={'User-Agent':'qqlive','Referer':'https://live.cctv.cn/','Accept':'application/vnd.apple.mpegurl,application/json,*/*'})
-    with robust_urlopen (req ,timeout =10 )as r :
-        text =r .read ().decode ('utf-8','replace')
-        final =r .geturl ()
+    try:
+        with robust_urlopen (req ,timeout =10 )as r :
+            text =r .read ().decode ('utf-8','replace')
+            final =r .geturl ()
+    except urllib.error.HTTPError as e:
+        # Log only non-secret response metadata; never expose signed URL query strings.
+        try:
+            parsed = urllib.parse.urlsplit(url)
+            host = parsed.hostname or 'unknown'
+            path_ext = parsed.path.rsplit('.', 1)[-1][:8] if '.' in parsed.path else 'noext'
+        except Exception:
+            host, path_ext = 'unknown', 'unknown'
+        hdrs = e.headers or {}
+        server = hdrs.get('Server', '-')[:80]
+        ctype = hdrs.get('Content-Type', '-')[:80]
+        via = hdrs.get('Via', '-')[:100]
+        xcache = hdrs.get('X-Cache', '-')[:100]
+        cf_ray = hdrs.get('CF-Ray', '-')[:80]
+        log('[BK-HTTP] status=%s host=%s depth=%s ext=%s server=%s type=%s via=%s x-cache=%s cf-ray=%s' %
+            (e.code, host, depth, path_ext, server, ctype, via, xcache, cf_ray), min_interval=5.0)
+        raise
     if depth <2 :
         lines =text .splitlines ()
         for i ,ln in enumerate (lines ):
