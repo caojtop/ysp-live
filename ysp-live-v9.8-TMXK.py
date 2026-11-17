@@ -1621,44 +1621,93 @@ class Resolver :
         elif display_rate_name in ('8K高清','4K高清','8K超高清','4K超高清'):
             display_rate_name ='高码率'
         return ChannelEntry (channel =channel ,live_id =live_id ,final_url =vdn .final_url ,playback_headers =playback_headers ,android_id =sess .profile .android_id ,x_uid =sess .identity .x_uid ,rate =live01 .rate ,rate_name =display_rate_name ,raw_live_host =url_host (live01 .live_url ),final_host =url_host (vdn .final_url ),refreshed_at =now ,expires_at =now +float (self .args .cache_ttl ),generation =generation ,last_refresh_error ='',last_refresh_failed_at =0.0 ,session_generation =sess .generation )
-    def live_v1_01_flow (self ,sess :AppSession ,live_id :str )->Live01Result :
-        body ={'screenParam':sess .screen_param ,'rate':'','systemType':'ios','model':sess .cast_model ,'id':live_id ,'userId':DEFAULT_LIVE_USER_ID ,'clientSign':'cctvVideo','deviceId':{'serial':'','imei':'','android_id':''}}
-        with self .control_request_slot ('live_v1_01'):
-            resp =sess .client .post_json (LIVE_V1_01_URL ,fresh_headers (sess .identity .headers ,'application/json','application/json',None ),body )
-        status ,text ,value =response_json (resp )
-        if not 200 <=status <300 :
-            raise YsptpError (f'live/v1/01 HTTP {status }: {text [:300 ]}')
-        videos =None 
-        if isinstance (value ,dict ):
-            data =value .get ('data')
-            if isinstance (data ,dict ):
-                videos =data .get ('videoList')or data .get ('videos')
-        if not isinstance (videos ,list ):
-            raise YsptpError ('live/v1/01 missing videos')
-        selected =None 
-        fallback =None 
-        for item in videos :
-            if not isinstance (item ,dict ):
-                continue 
-            url =item .get ('url')
-            if not isinstance (url ,str )or not url :
-                continue 
-            if fallback is None :
-                fallback =item 
-            if item .get ('rate')=='36p':
-                selected =item 
-                break 
-        video =selected if selected is not None else fallback 
-        if video is None :
-            raise YsptpError ('live/v1/01 no usable URL')
-        raw_url =video .get ('url','')
-        if raw_url .startswith ('http://')or raw_url .startswith ('https://'):
-            live_url =raw_url 
-        else :
-            live_url =aes_gcm_decrypt_b64 (raw_url ,sess .session_key )
-        rate =video .get ('rate')
-        rate_name =video .get ('rateName')
-        return Live01Result (live_url =live_url ,rate =rate if isinstance (rate ,str )else '',rate_name =rate_name if isinstance (rate_name ,str )else '')
+    def live_v1_01_flow(self, sess: AppSession, live_id: str) -> Live01Result:
+        base_body = {
+            'screenParam': sess.screen_param,
+            'rate': '',
+            'model': sess.cast_model,
+            'id': live_id,
+            'userId': DEFAULT_LIVE_USER_ID,
+            'clientSign': 'cctvVideo',
+        }
+
+        attempts = [
+            ('ios', {'serial': '', 'imei': '', 'android_id': ''}),
+            ('android', {
+                'serial': '',
+                'imei': '',
+                'android_id': sess.profile.android_id,
+            }),
+        ]
+
+        last_error = ''
+        for index, (system_type, device_id) in enumerate(attempts):
+            body = dict(base_body)
+            body['systemType'] = system_type
+            body['deviceId'] = device_id
+
+            with self.control_request_slot('live_v1_01'):
+                resp = sess.client.post_json(
+                    LIVE_V1_01_URL,
+                    fresh_headers(
+                        sess.identity.headers,
+                        'application/json',
+                        'application/json',
+                        None
+                    ),
+                    body
+                )
+
+            status, text, value = response_json(resp)
+            if not 200 <= status < 300:
+                last_error = f'live/v1/01 {system_type} HTTP {status}: {text[:300]}'
+                if status == 400 and index == 0:
+                    log('[高码率] iOS 请求返回 400，尝试 Android TV 参数重试')
+                    continue
+                raise YsptpError(last_error)
+
+            videos = None
+            if isinstance(value, dict):
+                data = value.get('data')
+                if isinstance(data, dict):
+                    videos = data.get('videoList') or data.get('videos')
+
+            if not isinstance(videos, list):
+                raise YsptpError('live/v1/01 missing videos')
+
+            selected = None
+            fallback = None
+            for item in videos:
+                if not isinstance(item, dict):
+                    continue
+                url = item.get('url')
+                if not isinstance(url, str) or not url:
+                    continue
+                if fallback is None:
+                    fallback = item
+                if item.get('rate') == '36p':
+                    selected = item
+                    break
+
+            video = selected if selected is not None else fallback
+            if video is None:
+                raise YsptpError('live/v1/01 no usable URL')
+
+            raw_url = video.get('url', '')
+            if raw_url.startswith(('http://', 'https://')):
+                live_url = raw_url
+            else:
+                live_url = aes_gcm_decrypt_b64(raw_url, sess.session_key)
+
+            rate = video.get('rate')
+            rate_name = video.get('rateName')
+            return Live01Result(
+                live_url=live_url,
+                rate=rate if isinstance(rate, str) else '',
+                rate_name=rate_name if isinstance(rate_name, str) else ''
+            )
+
+        raise YsptpError(last_error or 'live/v1/01 request failed')
     def live_v1_02_flow (self ,sess :AppSession )->str :
         with self .control_request_slot ('live_v1_02'):
             encrypted_guid =aes_gcm_encrypt_b64 ('',sess .session_key )
