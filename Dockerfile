@@ -14,6 +14,7 @@ WORKDIR /app
 
 COPY ysp-live-v9.8-TMXK.py /app/ysp-live-v9.8-TMXK.py
 COPY ysp-engine.js /app/ysp-engine.js
+COPY hongkong.py /app/hongkong.py
 COPY main.py /app/main.py
 
 RUN ln -sf /app/ysp-live-v9.8-TMXK.py /app/ysp-live.py
