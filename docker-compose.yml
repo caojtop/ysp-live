@@ -1,9 +1,10 @@
 
 services:
   ysp-live:
-    image: ysp-live:9.8-TMXK
+    image: ysp-live:9.8
     build:
       context: .
+      network: host
       dockerfile: Dockerfile
     container_name: ysp-live
     restart: unless-stopped
