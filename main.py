@@ -3,10 +3,10 @@
 
 启动顺序：
 1. 先把同目录的 hongkong.py 加载并注册为 ``hongkong``；
-2. 再加载 ysp-live-v9.5.py；
+2. 再加载 ysp-live.py；
 3. 把 hongkong 注册为核心扩展，然后调用 ysp-live 的 main()。
 
-ysp-live-v9.5.py 本身不包含任何凤凰/香港三台逻辑，只提供通用扩展接口；
+ysp-live.py 本身不包含任何凤凰/香港三台逻辑，只提供通用扩展接口；
 原有命令行参数、端口、环境变量全部保持不变。
 """
 
@@ -47,14 +47,14 @@ def _load_module(module_name: str, filename: str) -> ModuleType:
 def load_modules() -> tuple[ModuleType, ModuleType]:
     """加载凤凰模块和 ysp-live 主模块，并完成扩展注册。"""
     hk = _load_module("hongkong", "hongkong.py")
-    ysp = _load_module("ysp_live_v95", "ysp-live-v9.5.py")
+    ysp = _load_module("ysp_live", "ysp-live.py")
     if hk not in ysp.EXTENSIONS:
         ysp.register_extension(hk)
     return hk, ysp
 
 
 def main() -> int:
-    """启动 ysp-live；参数原样交给 ysp-live-v9.5.py 的 argparse。"""
+    """启动 ysp-live；参数原样交给 ysp-live.py 的 argparse。"""
     _hk, ysp = load_modules()
     result = ysp.main()
     return int(result or 0)
